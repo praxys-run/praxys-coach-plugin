@@ -575,7 +575,10 @@ def _parse_plan_csv(plan_csv: str) -> list[dict]:
 def _local_push_plan(plan_csv: str, mode: str) -> dict:
     """Local mirror of POST /api/plan/upload?mode=...."""
     from datetime import date as _date, datetime as _dt
-    from analysis.config import PRAXYS_PLAN_SOURCE, PRAXYS_PLAN_SOURCES
+    from analysis.config import (
+        PRAXYS_PLAN_SOURCES,
+        PRAXYS_PLAN_WRITE_SOURCE,
+    )
     from db.models import TrainingPlan
     db = _local_db()
     try:
@@ -600,7 +603,7 @@ def _local_push_plan(plan_csv: str, mode: str) -> dict:
         for kwargs in parsed:
             db.add(TrainingPlan(
                 user_id=user_id,
-                source=PRAXYS_PLAN_SOURCE,
+                source=PRAXYS_PLAN_WRITE_SOURCE,
                 workout_origin="generated",
                 meta={"uploaded_at": _dt.utcnow().isoformat()},
                 **kwargs,
@@ -667,6 +670,7 @@ def update_training_day(
             LEGACY_PRAXYS_PLAN_SOURCE,
             PRAXYS_PLAN_SOURCE,
             PRAXYS_PLAN_SOURCES,
+            PRAXYS_PLAN_WRITE_SOURCE,
         )
         from db.models import TrainingPlan
         try:
@@ -684,7 +688,7 @@ def update_training_day(
             plan = TrainingPlan(
                 user_id=user_id,
                 date=d,
-                source=PRAXYS_PLAN_SOURCE,
+                source=PRAXYS_PLAN_WRITE_SOURCE,
                 workout_origin="manual",
                 workout_type=workout_type,
                 planned_duration_min=planned_duration_min,

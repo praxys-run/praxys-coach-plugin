@@ -575,6 +575,7 @@ def _parse_plan_csv(plan_csv: str) -> list[dict]:
 def _local_push_plan(plan_csv: str, mode: str) -> dict:
     """Local mirror of POST /api/plan/upload?mode=...."""
     from datetime import date as _date, datetime as _dt
+    from analysis.config import PRAXYS_PLAN_SOURCE, PRAXYS_PLAN_SOURCES
     from db.models import TrainingPlan
     db = _local_db()
     try:
@@ -585,7 +586,7 @@ def _local_push_plan(plan_csv: str, mode: str) -> dict:
         if mode == "replace":
             db.query(TrainingPlan).filter(
                 TrainingPlan.user_id == user_id,
-                TrainingPlan.source == "ai",
+                TrainingPlan.source.in_(PRAXYS_PLAN_SOURCES),
                 TrainingPlan.date >= _date.today(),
             ).delete(synchronize_session=False)
         else:
@@ -593,12 +594,14 @@ def _local_push_plan(plan_csv: str, mode: str) -> dict:
             if target_dates:
                 db.query(TrainingPlan).filter(
                     TrainingPlan.user_id == user_id,
-                    TrainingPlan.source == "ai",
+                    TrainingPlan.source.in_(PRAXYS_PLAN_SOURCES),
                     TrainingPlan.date.in_(target_dates),
                 ).delete(synchronize_session=False)
         for kwargs in parsed:
             db.add(TrainingPlan(
-                user_id=user_id, source="ai",
+                user_id=user_id,
+                source=PRAXYS_PLAN_SOURCE,
+                workout_origin="generated",
                 meta={"uploaded_at": _dt.utcnow().isoformat()},
                 **kwargs,
             ))
@@ -610,12 +613,12 @@ def _local_push_plan(plan_csv: str, mode: str) -> dict:
 
 @mcp.tool()
 def push_training_plan(plan_csv: str, mode: str = "replace") -> str:
-    """Push an AI-generated training plan. Pass the plan as CSV text (columns: date,workout_type,planned_duration_min,planned_distance_km,target_power_min,target_power_max,workout_description).
+    """Push a Praxys-generated training plan. Pass the plan as CSV text (columns: date,workout_type,planned_duration_min,planned_distance_km,target_power_min,target_power_max,workout_description).
 
-    mode='replace' (default): wipes all future AI plan entries for this user, then inserts.
+    mode='replace' (default): wipes all future Praxys-owned plan entries for this user, then inserts.
     Use this for full-window plan generation (the typical 28-day plan).
 
-    mode='merge': only the dates in the CSV are touched; other AI rows are
+    mode='merge': only the dates in the CSV are touched; other Praxys rows are
     preserved. Use this when patching individual days without resending the
     whole plan.
     """
@@ -641,11 +644,12 @@ def update_training_day(
     target_power_max: float | None = None,
     workout_description: str | None = None,
 ) -> str:
-    """Upsert a single AI plan workout for the given date (YYYY-MM-DD).
+    """Upsert a single Praxys-owned workout for the given date (YYYY-MM-DD).
 
-    Replaces any existing AI entry for that date with the new values; other
-    dates are untouched. Use this for shifts and partial edits — much safer
-    than push_training_plan when you only want to change one day.
+    Replaces any existing Praxys-owned entry for that date with the new values;
+    external rows and other dates are untouched. Use this for shifts and
+    partial edits — much safer than push_training_plan when you only want to
+    change one day.
     """
     payload = {
         "workout_type": workout_type,
@@ -659,6 +663,11 @@ def update_training_day(
         data = _remote_put(f"/api/plan/{plan_date}", payload)
     else:
         from datetime import datetime as _dt
+        from analysis.config import (
+            LEGACY_PRAXYS_PLAN_SOURCE,
+            PRAXYS_PLAN_SOURCE,
+            PRAXYS_PLAN_SOURCES,
+        )
         from db.models import TrainingPlan
         try:
             d = _dt.strptime(plan_date, "%Y-%m-%d").date()
@@ -669,11 +678,14 @@ def update_training_day(
             user_id = _local_user_id()
             db.query(TrainingPlan).filter(
                 TrainingPlan.user_id == user_id,
-                TrainingPlan.source == "ai",
+                TrainingPlan.source.in_(PRAXYS_PLAN_SOURCES),
                 TrainingPlan.date == d,
             ).delete(synchronize_session=False)
             plan = TrainingPlan(
-                user_id=user_id, date=d, source="ai",
+                user_id=user_id,
+                date=d,
+                source=PRAXYS_PLAN_SOURCE,
+                workout_origin="manual",
                 workout_type=workout_type,
                 planned_duration_min=planned_duration_min,
                 planned_distance_km=planned_distance_km,
@@ -693,7 +705,9 @@ def update_training_day(
                 "target_power_min": plan.target_power_min,
                 "target_power_max": plan.target_power_max,
                 "workout_description": plan.workout_description,
-                "source": plan.source,
+                "source": LEGACY_PRAXYS_PLAN_SOURCE,
+                "owner": PRAXYS_PLAN_SOURCE,
+                "origin": plan.workout_origin,
             }
         finally:
             db.close()
@@ -702,11 +716,12 @@ def update_training_day(
 
 @mcp.tool()
 def delete_training_day(plan_date: str) -> str:
-    """Delete the AI plan workout(s) for the given date (YYYY-MM-DD)."""
+    """Delete the Praxys-owned workout(s) for the given date (YYYY-MM-DD)."""
     if IS_REMOTE:
         data = _remote_delete(f"/api/plan/{plan_date}")
     else:
         from datetime import datetime as _dt
+        from analysis.config import PRAXYS_PLAN_SOURCES
         from db.models import TrainingPlan
         try:
             d = _dt.strptime(plan_date, "%Y-%m-%d").date()
@@ -716,7 +731,7 @@ def delete_training_day(plan_date: str) -> str:
         try:
             deleted = db.query(TrainingPlan).filter(
                 TrainingPlan.user_id == _local_user_id(),
-                TrainingPlan.source == "ai",
+                TrainingPlan.source.in_(PRAXYS_PLAN_SOURCES),
                 TrainingPlan.date == d,
             ).delete(synchronize_session=False)
             db.commit()

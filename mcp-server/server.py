@@ -16,6 +16,7 @@ import json
 import os
 import sys
 import logging
+from datetime import date, datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +83,11 @@ _NOT_AUTHENTICATED_MSG = (
 )
 
 
+def _api_error_message(status_code: int, detail=None) -> str:
+    suffix = f": {detail}" if detail else ""
+    return f"API request failed (HTTP {status_code}){suffix}"
+
+
 def _get_remote_headers():
     """Get auth headers for remote API calls."""
     for path in (_TOKEN_PATH, _LEGACY_TOKEN_PATH):
@@ -110,10 +116,7 @@ def _check_auth_error(res):
                 detail = body.get("detail") or body.get("message") or ""
         except ValueError:
             pass
-        suffix = f": {detail}" if detail else ""
-        raise RuntimeError(
-            f"API request failed (HTTP {res.status_code}){suffix}"
-        )
+        raise RuntimeError(_api_error_message(res.status_code, detail))
 
 
 def _remote_get(path: str) -> dict:
@@ -214,6 +217,192 @@ def _local_dashboard_data() -> dict:
         db.close()
 
 
+def _local_route_result(callback):
+    """Call a FastAPI route directly while preserving its HTTP error text."""
+    from fastapi import HTTPException
+    from pydantic import ValidationError
+
+    try:
+        return callback()
+    except ValidationError as exc:
+        raise RuntimeError(
+            _api_error_message(
+                422,
+                exc.errors(include_url=False),
+            )
+        ) from exc
+    except HTTPException as exc:
+        if exc.status_code == 401:
+            raise RuntimeError(_NOT_AUTHENTICATED_MSG) from exc
+        raise RuntimeError(
+            _api_error_message(exc.status_code, exc.detail)
+        ) from exc
+
+
+def _local_data_user_id(db) -> str:
+    """Mirror get_data_user_id without requiring an HTTP request."""
+    from db.models import User
+
+    user_id = _local_user_id()
+    user = db.query(User).filter(User.id == user_id).first()
+    if user is None:
+        raise RuntimeError(_NOT_AUTHENTICATED_MSG)
+    if not user.is_demo:
+        return user_id
+    target = db.query(User).filter(
+        User.id == user.demo_of,
+        User.is_active == True,
+    ).first()
+    if target is None:
+        raise RuntimeError(
+            _api_error_message(
+                403,
+                "Demo source account is no longer available",
+            )
+        )
+    return target.id
+
+
+def _local_write_user_id(db) -> str:
+    """Mirror require_write_access without requiring an HTTP request."""
+    from db.models import User
+
+    user_id = _local_user_id()
+    user = db.query(User).filter(User.id == user_id).first()
+    if user is None:
+        raise RuntimeError(_NOT_AUTHENTICATED_MSG)
+    if user.is_demo:
+        raise RuntimeError(
+            _api_error_message(403, "Demo accounts cannot modify data")
+        )
+    return user_id
+
+
+def _local_get_settings() -> dict:
+    db = _local_db()
+    try:
+        from api.routes.settings import get_settings as get_settings_route
+
+        user_id = _local_data_user_id(db)
+        return _local_route_result(
+            lambda: get_settings_route(user_id=user_id, db=db)
+        )
+    finally:
+        db.close()
+
+
+def _local_get_plan(start: str, end: str) -> dict:
+    db = _local_db()
+    try:
+        from api.routes.plan import get_plan as get_plan_route
+        from starlette.requests import Request
+        from starlette.responses import Response
+
+        user_id = _local_data_user_id(db)
+        request = Request({
+            "type": "http",
+            "http_version": "1.1",
+            "method": "GET",
+            "scheme": "http",
+            "path": "/api/plan",
+            "raw_path": b"/api/plan",
+            "query_string": b"",
+            "headers": [],
+            "client": ("local", 0),
+            "server": ("local", 80),
+        })
+        result = _local_route_result(
+            lambda: get_plan_route(
+                request=request,
+                response=Response(),
+                start=start,
+                end=end,
+                user_id=user_id,
+                db=db,
+            )
+        )
+        if hasattr(result, "body"):
+            return json.loads(bytes(result.body).decode("utf-8"))
+        return result
+    finally:
+        db.close()
+
+
+def _local_update_settings(payload: dict) -> dict:
+    db = _local_db()
+    try:
+        from api.routes.settings import (
+            SettingsUpdate,
+            update_settings as update_settings_route,
+        )
+
+        user_id = _local_write_user_id(db)
+        body = _local_route_result(lambda: SettingsUpdate(**payload))
+        return _local_route_result(
+            lambda: update_settings_route(
+                body=body,
+                user_id=user_id,
+                db=db,
+            )
+        )
+    finally:
+        db.close()
+
+
+def _local_cleanup_managed_deliveries() -> dict:
+    db = _local_db()
+    try:
+        from api.routes.plan import (
+            CleanupPlanDeliveriesRequest,
+            cleanup_plan_deliveries,
+        )
+        from sqlalchemy.exc import SQLAlchemyError
+
+        user_id = _local_write_user_id(db)
+        try:
+            return _local_route_result(
+                lambda: cleanup_plan_deliveries(
+                    request=CleanupPlanDeliveriesRequest(scope="future"),
+                    current_user_id=user_id,
+                    db=db,
+                )
+            )
+        except SQLAlchemyError as exc:
+            db.rollback()
+            raise RuntimeError(_api_error_message(500)) from exc
+    finally:
+        db.close()
+
+
+def _local_resolve_plan_conflict(
+    reconciliation_id: str,
+    action: str,
+) -> dict:
+    db = _local_db()
+    try:
+        from api.routes.plan import (
+            ResolvePlanReconciliationRequest,
+            resolve_plan_reconciliation,
+        )
+
+        user_id = _local_write_user_id(db)
+        body = _local_route_result(
+            lambda: ResolvePlanReconciliationRequest(
+                reconciliation_id=reconciliation_id,
+                action=action,
+            )
+        )
+        return _local_route_result(
+            lambda: resolve_plan_reconciliation(
+                request=body,
+                current_user_id=user_id,
+                db=db,
+            )
+        )
+    finally:
+        db.close()
+
+
 # ---------------------------------------------------------------------------
 # MCP Tools — Training Data
 # ---------------------------------------------------------------------------
@@ -292,38 +481,32 @@ def get_settings() -> str:
     if IS_REMOTE:
         data = _remote_get("/api/settings")
     else:
-        db = _local_db()
-        try:
-            from analysis.config import load_config_from_db
-            from analysis.training_base import get_display_config
-            config = load_config_from_db(_local_user_id(), db)
-            from dataclasses import asdict
-            data = {
-                "config": asdict(config),
-                "display": get_display_config(config.training_base),
-            }
-        finally:
-            db.close()
+        data = _local_get_settings()
     return json.dumps(data, indent=2, default=str)
 
 
 @mcp.tool()
 def update_settings(settings: dict) -> str:
-    """Update user settings. Pass a dict with fields to update (training_base, thresholds, zones, goal, science)."""
+    """Update ordinary user settings such as training_base, zones, or goal.
+
+    Managed-plan fields are intentionally rejected here. Use the dedicated
+    adopt, pause, resume, and leave tools so consent and preview fencing cannot
+    be bypassed.
+    """
+    managed_fields = {
+        "plan_management",
+        "managed_plan_preview_start",
+    }
+    blocked = sorted(managed_fields.intersection(settings))
+    if blocked:
+        return _managed_plan_error(
+            "Managed-plan settings require dedicated lifecycle tools; "
+            f"unsupported fields: {', '.join(blocked)}"
+        )
     if IS_REMOTE:
         data = _remote_put("/api/settings", settings)
     else:
-        db = _local_db()
-        try:
-            from analysis.config import load_config_from_db, save_config_to_db
-            config = load_config_from_db(_local_user_id(), db)
-            for key, value in settings.items():
-                if hasattr(config, key):
-                    setattr(config, key, value)
-            save_config_to_db(_local_user_id(), config, db)
-            data = {"status": "updated"}
-        finally:
-            db.close()
+        data = _local_update_settings(settings)
     return json.dumps(data, indent=2, default=str)
 
 
@@ -546,95 +729,450 @@ def disconnect_platform(platform: str) -> str:
 # MCP Tools — Plans & Sync
 # ---------------------------------------------------------------------------
 
-def _parse_plan_csv(plan_csv: str) -> list[dict]:
-    """Parse a plan CSV into TrainingPlan kwargs dicts. Raises ValueError on bad rows."""
-    import csv as _csv
-    import io as _io
-    from datetime import datetime as _dt
-
-    rows = []
-    reader = _csv.DictReader(_io.StringIO(plan_csv))
-    for i, raw in enumerate(reader):
-        d_raw = raw.get("date", "")
-        rows.append({
-            "date": _dt.strptime(d_raw, "%Y-%m-%d").date() if d_raw else None,
-            "workout_type": raw.get("workout_type", ""),
-            "planned_duration_min": float(raw["planned_duration_min"])
-                if raw.get("planned_duration_min") else None,
-            "planned_distance_km": float(raw["planned_distance_km"])
-                if raw.get("planned_distance_km") else None,
-            "target_power_min": float(raw["target_power_min"])
-                if raw.get("target_power_min") else None,
-            "target_power_max": float(raw["target_power_max"])
-                if raw.get("target_power_max") else None,
-            "workout_description": raw.get("workout_description", ""),
-        })
-    return rows
-
-
 def _local_push_plan(plan_csv: str, mode: str) -> dict:
     """Local mirror of POST /api/plan/upload?mode=...."""
-    from datetime import date as _date, datetime as _dt
-    from analysis.config import (
-        PRAXYS_PLAN_SOURCES,
-        PRAXYS_PLAN_WRITE_SOURCE,
-    )
-    from db.models import TrainingPlan
     db = _local_db()
     try:
-        parsed = _parse_plan_csv(plan_csv)
-        if not parsed:
-            return {"status": "error", "message": "No rows in CSV"}
-        user_id = _local_user_id()
-        if mode == "replace":
-            db.query(TrainingPlan).filter(
-                TrainingPlan.user_id == user_id,
-                TrainingPlan.source.in_(PRAXYS_PLAN_SOURCES),
-                TrainingPlan.date >= _date.today(),
-            ).delete(synchronize_session=False)
-        else:
-            target_dates = {p["date"] for p in parsed if p["date"] is not None}
-            if target_dates:
-                db.query(TrainingPlan).filter(
-                    TrainingPlan.user_id == user_id,
-                    TrainingPlan.source.in_(PRAXYS_PLAN_SOURCES),
-                    TrainingPlan.date.in_(target_dates),
-                ).delete(synchronize_session=False)
-        for kwargs in parsed:
-            db.add(TrainingPlan(
+        from api.routes.ai import PlanUpload, upload_plan
+
+        user_id = _local_write_user_id(db)
+        return _local_route_result(
+            lambda: upload_plan(
+                payload=PlanUpload(csv=plan_csv),
+                mode=mode,
                 user_id=user_id,
-                source=PRAXYS_PLAN_WRITE_SOURCE,
-                workout_origin="generated",
-                meta={"uploaded_at": _dt.utcnow().isoformat()},
-                **kwargs,
-            ))
-        db.commit()
-        return {"status": "saved", "rows": len(parsed), "mode": mode}
+                db=db,
+            )
+        )
     finally:
         db.close()
 
 
-@mcp.tool()
-def push_training_plan(plan_csv: str, mode: str = "replace") -> str:
-    """Push a Praxys-generated training plan. Pass the plan as CSV text (columns: date,workout_type,planned_duration_min,planned_distance_km,target_power_min,target_power_max,workout_description).
+_PLAN_AUTHORING_GUIDANCE = (
+    "This operation saves canonical Praxys plan rows. It does not directly "
+    "request an execution-platform mutation. If managed delivery is already "
+    "enabled, Praxys may independently deliver the saved rows under that "
+    "existing policy."
+)
 
-    mode='replace' (default): wipes all future Praxys-owned plan entries for this user, then inserts.
-    Use this for full-window plan generation (the typical 28-day plan).
 
-    mode='merge': only the dates in the CSV are touched; other Praxys rows are
-    preserved. Use this when patching individual days without resending the
-    whole plan.
-    """
+def _save_training_plan(plan_csv: str, mode: str) -> dict:
     if mode not in ("replace", "merge"):
-        return json.dumps({"status": "error", "message": "mode must be 'replace' or 'merge'"})
+        return {
+            "status": "error",
+            "message": "mode must be 'replace' or 'merge'",
+            "operation": "plan_authoring",
+            "direct_delivery_requested": False,
+            "guidance": _PLAN_AUTHORING_GUIDANCE,
+        }
     if IS_REMOTE:
         data = _remote_post(f"/api/plan/upload?mode={mode}", {"csv": plan_csv})
     else:
-        try:
-            data = _local_push_plan(plan_csv, mode)
-        except ValueError as e:
-            data = {"status": "error", "message": f"Invalid CSV: {e}"}
+        data = _local_push_plan(plan_csv, mode)
+    data = dict(data)
+    data.update({
+        "operation": "plan_authoring",
+        "direct_delivery_requested": False,
+        "guidance": _PLAN_AUTHORING_GUIDANCE,
+    })
+    return data
+
+
+@mcp.tool()
+def save_training_plan(plan_csv: str, mode: str = "replace") -> str:
+    """Save authored workouts into the canonical Praxys plan.
+
+    This is a plan-authoring operation, not a direct platform-delivery command.
+    Pass CSV text with date, workout_type, planned_duration_min,
+    planned_distance_km, target_power_min, target_power_max, and
+    workout_description columns.
+
+    mode='replace' replaces future Praxys-owned rows. mode='merge' changes only
+    dates present in the CSV. Manual and external-coach rows remain untouched.
+    """
+    data = _save_training_plan(plan_csv, mode)
     return json.dumps(data, indent=2, default=str)
+
+
+@mcp.tool()
+def push_training_plan(plan_csv: str, mode: str = "replace") -> str:
+    """Backward-compatible alias for save_training_plan.
+
+    Despite the historical name, this authors canonical Praxys plan rows; it
+    does not directly push workouts to an execution platform. New callers
+    should use save_training_plan so authoring and delivery are unambiguous.
+    """
+    data = _save_training_plan(plan_csv, mode)
+    data["deprecated_tool"] = (
+        "Use save_training_plan for plan authoring. Managed delivery is "
+        "controlled separately."
+    )
+    return json.dumps(data, indent=2, default=str)
+
+
+def _managed_plan_settings() -> dict:
+    if IS_REMOTE:
+        return _remote_get("/api/settings")
+    return _local_get_settings()
+
+
+def _managed_plan_window(days: int) -> dict:
+    today = datetime.now(timezone.utc).date()
+    end = today + timedelta(days=days - 1)
+    start_iso = today.isoformat()
+    end_iso = end.isoformat()
+    if IS_REMOTE:
+        return _remote_get(
+            f"/api/plan?start={start_iso}&end={end_iso}"
+        )
+    return _local_get_plan(start_iso, end_iso)
+
+
+def _managed_plan_update(payload: dict) -> dict:
+    if IS_REMOTE:
+        return _remote_put("/api/settings", payload)
+    return _local_update_settings(payload)
+
+
+def _managed_plan_cleanup() -> dict:
+    if IS_REMOTE:
+        import requests
+
+        try:
+            return _remote_post(
+                "/api/plan/deliveries/cleanup",
+                {"scope": "future"},
+            )
+        except requests.RequestException as exc:
+            raise RuntimeError(
+                f"Managed-plan cleanup request failed: {exc}"
+            ) from exc
+    return _local_cleanup_managed_deliveries()
+
+
+def _managed_plan_resolve(
+    reconciliation_id: str,
+    action: str,
+) -> dict:
+    if IS_REMOTE:
+        return _remote_post(
+            "/api/plan/reconciliation/resolve",
+            {
+                "reconciliation_id": reconciliation_id,
+                "action": action,
+            },
+        )
+    return _local_resolve_plan_conflict(reconciliation_id, action)
+
+
+def _plan_management(settings: dict) -> dict:
+    config = settings.get("config") or {}
+    return dict(config.get("plan_management") or {})
+
+
+def _managed_plan_error(message: str, settings: dict | None = None) -> str:
+    data = {"status": "error", "message": message}
+    if settings is not None:
+        data["plan_management"] = _plan_management(settings)
+    return json.dumps(data, indent=2, default=str)
+
+
+def _managed_preview_error(
+    preview_start: str,
+    preview_end: str,
+) -> str | None:
+    try:
+        start = date.fromisoformat(preview_start)
+        end = date.fromisoformat(preview_end)
+    except ValueError:
+        return "preview_start and preview_end must be YYYY-MM-DD dates"
+    if end - start != timedelta(days=13):
+        return "Managed-plan adoption requires the reviewed 14-day window"
+    return None
+
+
+def _managed_plan_lifecycle_result(
+    operation: str,
+    response: dict,
+    *,
+    status: str | None = None,
+) -> dict:
+    return {
+        "status": status or response.get("status") or "ok",
+        "operation": operation,
+        "plan_management": _plan_management(response),
+        "connection_statuses": response.get("connection_statuses") or {},
+    }
+
+
+def _is_praxys_owned_workout(workout: dict) -> bool:
+    owner = workout.get("owner")
+    return owner == "praxys" or (
+        owner is None and workout.get("source") == "ai"
+    )
+
+
+@mcp.tool()
+def get_managed_plan_status(days: int = 14) -> str:
+    """Get managed-plan settings, delivery state, workouts, and conflicts.
+
+    The returned workouts include canonical IDs and opaque reconciliation IDs
+    required by resolution tools. This read never changes a target calendar.
+    """
+    if isinstance(days, bool) or not isinstance(days, int) or not 1 <= days <= 365:
+        return _managed_plan_error("days must be an integer from 1 to 365")
+
+    settings = _managed_plan_settings()
+    plan = _managed_plan_window(days)
+    management = _plan_management(settings)
+    connection_statuses = settings.get("connection_statuses") or {}
+    capabilities = settings.get("platform_capabilities") or {}
+    target = management.get("execution_target")
+    workouts = list(plan.get("workouts") or [])
+    praxys_count = sum(
+        1 for workout in workouts if _is_praxys_owned_workout(workout)
+    )
+    conflict_count = sum(
+        1
+        for workout in workouts
+        if (workout.get("reconciliation") or {}).get("conflict") is True
+    )
+    available_targets = [
+        platform
+        for platform, connection_status in connection_statuses.items()
+        if (
+            connection_status == "connected"
+            and (capabilities.get(platform) or {}).get("plan") is True
+        )
+    ]
+    data = {
+        "status": "ok",
+        "plan_management": management,
+        "execution_target_status": (
+            connection_statuses.get(target, "not_configured")
+            if target
+            else "not_configured"
+        ),
+        "available_execution_targets": available_targets,
+        "window": plan.get("window") or {},
+        "summary": {
+            "praxys_workouts": praxys_count,
+            "external_workouts": len(workouts) - praxys_count,
+            "conflicts": conflict_count,
+        },
+        "workouts": workouts,
+        "semantics": {
+            "authoring": (
+                "save_training_plan changes the canonical Praxys plan."
+            ),
+            "delivery": (
+                "Managed delivery copies canonical workouts to the selected "
+                "execution target under the user's existing consent."
+            ),
+            "ownership": (
+                "Manual and external-coach workouts remain untouched."
+            ),
+        },
+    }
+    return json.dumps(data, indent=2, default=str)
+
+
+@mcp.tool()
+def adopt_managed_plan(
+    execution_target: str,
+    preview_start: str,
+    preview_end: str,
+) -> str:
+    """Adopt Praxys as planner and enable delivery after explicit approval.
+
+    Pass the exact window.start and window.end from a freshly fetched
+    get_managed_plan_status(days=14) result. Only call after the user reviewed
+    that window and explicitly consented. Existing manual and external-coach
+    workouts are not adopted or removed.
+    """
+    target = execution_target.strip().lower()
+    if not target:
+        return _managed_plan_error("execution_target is required")
+    preview_error = _managed_preview_error(preview_start, preview_end)
+    if preview_error:
+        return _managed_plan_error(preview_error)
+    settings = _managed_plan_settings()
+    management = _plan_management(settings)
+    if management.get("mode") != "external":
+        return _managed_plan_error(
+            "Managed mode is already adopted; use resume_managed_plan if it "
+            "is paused.",
+            settings,
+        )
+    response = _managed_plan_update({
+        "managed_plan_preview_start": preview_start,
+        "plan_management": {
+            "mode": "praxys",
+            "execution_target": target,
+            "delivery_enabled": True,
+            "adjustment_policy": "suggest_only",
+        },
+    })
+    return json.dumps(
+        _managed_plan_lifecycle_result("adopt", response),
+        indent=2,
+        default=str,
+    )
+
+
+@mcp.tool()
+def pause_managed_plan() -> str:
+    """Pause managed delivery without changing the canonical Praxys plan."""
+    settings = _managed_plan_settings()
+    management = _plan_management(settings)
+    if management.get("mode") != "praxys":
+        return _managed_plan_error(
+            "Managed mode is not active; adopt a plan before pausing.",
+            settings,
+        )
+    if management.get("delivery_enabled") is False:
+        return json.dumps(
+            _managed_plan_lifecycle_result(
+                "pause",
+                settings,
+                status="unchanged",
+            ),
+            indent=2,
+            default=str,
+        )
+    response = _managed_plan_update({
+        "plan_management": {"delivery_enabled": False},
+    })
+    return json.dumps(
+        _managed_plan_lifecycle_result("pause", response),
+        indent=2,
+        default=str,
+    )
+
+
+@mcp.tool()
+def resume_managed_plan(
+    preview_start: str,
+    preview_end: str,
+) -> str:
+    """Resume an adopted plan after reviewing its current 14-day window.
+
+    Pass the exact window.start and window.end from a freshly fetched
+    get_managed_plan_status(days=14) result.
+    """
+    preview_error = _managed_preview_error(preview_start, preview_end)
+    if preview_error:
+        return _managed_plan_error(preview_error)
+    settings = _managed_plan_settings()
+    management = _plan_management(settings)
+    if management.get("mode") != "praxys":
+        return _managed_plan_error(
+            "Managed mode is not adopted; use adopt_managed_plan instead.",
+            settings,
+        )
+    if management.get("delivery_enabled") is True:
+        return json.dumps(
+            _managed_plan_lifecycle_result(
+                "resume",
+                settings,
+                status="unchanged",
+            ),
+            indent=2,
+            default=str,
+        )
+    response = _managed_plan_update({
+        "managed_plan_preview_start": preview_start,
+        "plan_management": {"delivery_enabled": True},
+    })
+    return json.dumps(
+        _managed_plan_lifecycle_result("resume", response),
+        indent=2,
+        default=str,
+    )
+
+
+@mcp.tool()
+def leave_managed_plan(remove_future_deliveries: bool = False) -> str:
+    """Leave managed mode, optionally removing ledger-owned future deliveries.
+
+    Completed activity history is never removed. If removal is requested,
+    only future workouts attributable to the Praxys delivery ledger are
+    targeted; manual and external-coach workouts remain untouched.
+    """
+    settings = _managed_plan_settings()
+    management = _plan_management(settings)
+    if management.get("mode") == "external":
+        response = settings
+        status = "unchanged"
+    else:
+        response = _managed_plan_update({
+            "plan_management": {
+                "mode": "external",
+                "delivery_enabled": False,
+            },
+        })
+        status = None
+    result = _managed_plan_lifecycle_result(
+        "leave",
+        response,
+        status=status,
+    )
+    if not remove_future_deliveries:
+        result["cleanup"] = {"status": "kept"}
+        return json.dumps(result, indent=2, default=str)
+    try:
+        cleanup = _managed_plan_cleanup()
+    except RuntimeError as exc:
+        result["status"] = "partial"
+        result["cleanup"] = {
+            "status": "error",
+            "message": str(exc),
+            "retry_tool": "cleanup_managed_plan_deliveries",
+        }
+        return json.dumps(result, indent=2, default=str)
+    result["cleanup"] = cleanup
+    if cleanup.get("status") == "partial":
+        result["status"] = "partial"
+    return json.dumps(result, indent=2, default=str)
+
+
+@mcp.tool()
+def cleanup_managed_plan_deliveries() -> str:
+    """Retry ledger-scoped removal after leaving managed mode."""
+    settings = _managed_plan_settings()
+    if _plan_management(settings).get("mode") != "external":
+        return _managed_plan_error(
+            "Leave managed mode before removing future deliveries.",
+            settings,
+        )
+    return json.dumps(
+        _managed_plan_cleanup(),
+        indent=2,
+        default=str,
+    )
+
+
+@mcp.tool()
+def resolve_managed_plan_conflict(
+    reconciliation_id: str,
+    action: str,
+) -> str:
+    """Resolve one visible conflict using its opaque reconciliation ID.
+
+    action must be accept_target (adopt the observed platform version) or
+    restore_praxys (keep Praxys canonical and restore the target copy).
+    """
+    if action not in ("accept_target", "restore_praxys"):
+        return _managed_plan_error(
+            "action must be 'accept_target' or 'restore_praxys'"
+        )
+    if not reconciliation_id:
+        return _managed_plan_error("reconciliation_id is required")
+    return json.dumps(
+        _managed_plan_resolve(reconciliation_id, action),
+        indent=2,
+        default=str,
+    )
 
 
 @mcp.tool()
@@ -651,7 +1189,7 @@ def update_training_day(
 
     Replaces any existing Praxys-owned entry for that date with the new values;
     external rows and other dates are untouched. Use this for shifts and
-    partial edits — much safer than push_training_plan when you only want to
+    partial edits — much safer than save_training_plan when you only want to
     change one day.
     """
     payload = {
@@ -665,54 +1203,19 @@ def update_training_day(
     if IS_REMOTE:
         data = _remote_put(f"/api/plan/{plan_date}", payload)
     else:
-        from datetime import datetime as _dt
-        from analysis.config import (
-            LEGACY_PRAXYS_PLAN_SOURCE,
-            PRAXYS_PLAN_SOURCE,
-            PRAXYS_PLAN_SOURCES,
-            PRAXYS_PLAN_WRITE_SOURCE,
-        )
-        from db.models import TrainingPlan
-        try:
-            d = _dt.strptime(plan_date, "%Y-%m-%d").date()
-        except ValueError:
-            return json.dumps({"status": "error", "message": "date must be YYYY-MM-DD"})
         db = _local_db()
         try:
-            user_id = _local_user_id()
-            db.query(TrainingPlan).filter(
-                TrainingPlan.user_id == user_id,
-                TrainingPlan.source.in_(PRAXYS_PLAN_SOURCES),
-                TrainingPlan.date == d,
-            ).delete(synchronize_session=False)
-            plan = TrainingPlan(
-                user_id=user_id,
-                date=d,
-                source=PRAXYS_PLAN_WRITE_SOURCE,
-                workout_origin="manual",
-                workout_type=workout_type,
-                planned_duration_min=planned_duration_min,
-                planned_distance_km=planned_distance_km,
-                target_power_min=target_power_min,
-                target_power_max=target_power_max,
-                workout_description=workout_description or "",
-                meta={"uploaded_at": _dt.utcnow().isoformat()},
+            from api.routes.ai import PlanWorkout, upsert_plan_day
+
+            user_id = _local_write_user_id(db)
+            data = _local_route_result(
+                lambda: upsert_plan_day(
+                    plan_date=plan_date,
+                    workout=PlanWorkout(**payload),
+                    user_id=user_id,
+                    db=db,
+                )
             )
-            db.add(plan)
-            db.commit()
-            db.refresh(plan)
-            data = {
-                "id": plan.id, "date": plan.date.isoformat(),
-                "workout_type": plan.workout_type,
-                "planned_duration_min": plan.planned_duration_min,
-                "planned_distance_km": plan.planned_distance_km,
-                "target_power_min": plan.target_power_min,
-                "target_power_max": plan.target_power_max,
-                "workout_description": plan.workout_description,
-                "source": LEGACY_PRAXYS_PLAN_SOURCE,
-                "owner": PRAXYS_PLAN_SOURCE,
-                "origin": plan.workout_origin,
-            }
         finally:
             db.close()
     return json.dumps(data, indent=2, default=str)
@@ -724,22 +1227,18 @@ def delete_training_day(plan_date: str) -> str:
     if IS_REMOTE:
         data = _remote_delete(f"/api/plan/{plan_date}")
     else:
-        from datetime import datetime as _dt
-        from analysis.config import PRAXYS_PLAN_SOURCES
-        from db.models import TrainingPlan
-        try:
-            d = _dt.strptime(plan_date, "%Y-%m-%d").date()
-        except ValueError:
-            return json.dumps({"status": "error", "message": "date must be YYYY-MM-DD"})
         db = _local_db()
         try:
-            deleted = db.query(TrainingPlan).filter(
-                TrainingPlan.user_id == _local_user_id(),
-                TrainingPlan.source.in_(PRAXYS_PLAN_SOURCES),
-                TrainingPlan.date == d,
-            ).delete(synchronize_session=False)
-            db.commit()
-            data = {"status": "deleted", "rows": deleted, "date": plan_date}
+            from api.routes.ai import delete_plan_day
+
+            user_id = _local_write_user_id(db)
+            data = _local_route_result(
+                lambda: delete_plan_day(
+                    plan_date=plan_date,
+                    user_id=user_id,
+                    db=db,
+                )
+            )
         finally:
             db.close()
     return json.dumps(data, indent=2, default=str)

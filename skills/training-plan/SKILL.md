@@ -25,6 +25,10 @@ Call `get_training_context`. This returns everything needed in one call:
 - `current_plan`: existing future workouts (if any)
 - `science`: active theories for load, zones, prediction
 
+Also call `get_managed_plan_status` to distinguish canonical plan authoring
+from execution-platform delivery. Do not change managed mode while generating
+or editing a plan unless the user separately asks for that lifecycle change.
+
 ## Step 2: Analyze (do NOT call any tools — just reason)
 
 From the context, determine:
@@ -76,11 +80,18 @@ Ask: "Does this look good? I can adjust intensity, swap workouts, or regenerate.
 
 ## Step 5: Save (on user approval only)
 
-Convert the plan to CSV and call `push_training_plan`:
+Convert the plan to CSV and call `save_training_plan`:
 
 ```
 date,workout_type,planned_duration_min,planned_distance_km,target_power_min,target_power_max,workout_description
 2026-04-18,easy,50,10.0,150,190,Easy aerobic run in Zone 2
 ```
 
-Tell the user: "Plan saved. Set your plan source to 'AI' in Settings to see it on the dashboard."
+`save_training_plan` authors the canonical Praxys plan. It is not a direct
+platform-push command. If managed delivery was already enabled,
+`get_managed_plan_status` shows the execution target and resulting delivery or
+conflict state. Otherwise tell the user the plan is saved in Praxys and ask
+separately whether they want to review and adopt managed delivery.
+
+`push_training_plan` is a backward-compatible alias for existing clients only.
+Do not use it in new workflows.

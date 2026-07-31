@@ -19,7 +19,30 @@ The plugin exposes 8 skills (auto-discovered when installed):
 | `science` | Browse and switch training science theories (load, recovery, prediction, zones) |
 | `add-metric` | (Developer skill) Scaffold a new training metric end-to-end |
 
-Backed by an MCP server with tools like `get_daily_brief`, `get_race_forecast`, `get_training_review`, `trigger_sync`, `update_settings`, etc.
+Backed by an MCP server with tools like `get_daily_brief`, `get_race_forecast`, `get_training_review`, `trigger_sync`, and `update_settings`.
+
+### Plan authoring vs. managed delivery
+
+The plugin keeps these operations explicit:
+
+- `save_training_plan` authors canonical future workouts in Praxys. It does not
+  directly select or mutate an execution platform.
+- `push_training_plan` remains as a backward-compatible alias, but new callers
+  should use `save_training_plan`.
+- `get_managed_plan_status` reports ownership, delivery state, the 14-day plan,
+  and opaque conflict IDs.
+- `adopt_managed_plan`, `pause_managed_plan`, `resume_managed_plan`, and
+  `leave_managed_plan` control the user's managed-delivery consent.
+- `resolve_managed_plan_conflict` accepts only the server-provided
+  `accept_target` and `restore_praxys` actions.
+
+When managed delivery is already enabled, Praxys may independently deliver a
+newly saved canonical plan under that existing consent. Manual workouts and
+workouts from another coach remain untouched.
+
+Adoption and resume require the exact `window.start` and `window.end` from a
+fresh `get_managed_plan_status(days=14)` result, preventing approval from being
+reused after the UTC review window changes.
 
 ## Install
 

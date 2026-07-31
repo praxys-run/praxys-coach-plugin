@@ -52,7 +52,30 @@ Platform capabilities:
 - **activities**: garmin, stryd, coros
 - **recovery**: garmin, oura
 - **fitness**: garmin, stryd, coros (auto-merged)
-- **plan**: garmin, stryd, coros, ai
+- **managed-plan execution**: Stryd today; inspect
+  `get_managed_plan_status.available_execution_targets` rather than assuming a
+  connected platform supports writes
+
+### Managed Plan Ownership
+
+Call `get_managed_plan_status` before discussing plan ownership or delivery.
+Praxys changes only canonical workouts it authored or the user explicitly
+adopted. Manual workouts and workouts from another coach remain untouched.
+
+- `adopt_managed_plan` requires explicit user approval after plan review. Pass
+  the exact `window.start` and `window.end` from a fresh
+  `get_managed_plan_status(days=14)` result.
+- `pause_managed_plan` keeps the canonical plan but stops target mutations.
+- `resume_managed_plan` resumes an already-adopted plan after the same fresh
+  14-day review-window check.
+- `leave_managed_plan` is reversible and can either keep future delivered
+  workouts or remove only ledger-owned future deliveries.
+- `resolve_managed_plan_conflict` must receive the opaque reconciliation ID and
+  one of the actions returned by `get_managed_plan_status`.
+
+Use one planner at a time to avoid overlapping sessions. Platform connection
+setup still belongs on praxys.run; the MCP lifecycle tools do not collect
+connector credentials.
 
 ### 2. Training Base
 

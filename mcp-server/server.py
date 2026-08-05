@@ -13,6 +13,7 @@ Production is the default so the plugin works out-of-the-box for end users.
 Set PRAXYS_LOCAL=1 in your shell to develop against the local FastAPI/DB.
 """
 import json
+import importlib.util
 import os
 import sys
 import logging
@@ -21,10 +22,32 @@ from datetime import date, datetime, timedelta, timezone
 logger = logging.getLogger(__name__)
 
 # Add project root to path for local mode imports
+_MCP_SERVER_DIR = os.path.abspath(os.path.dirname(__file__))
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 sys.path.insert(0, _PROJECT_ROOT)
+sys.path.insert(0, _MCP_SERVER_DIR)
 
 from mcp.server.fastmcp import FastMCP
+
+_AUTH_MODULE_NAME = "praxys_mcp_auth"
+_AUTH_MODULE_PATH = os.path.join(_MCP_SERVER_DIR, "auth.py")
+_auth = sys.modules.get(_AUTH_MODULE_NAME)
+if _auth is None:
+    _auth_spec = importlib.util.spec_from_file_location(
+        _AUTH_MODULE_NAME,
+        _AUTH_MODULE_PATH,
+    )
+    if _auth_spec is None or _auth_spec.loader is None:
+        raise ImportError(f"Cannot load {_AUTH_MODULE_PATH}")
+    _auth = importlib.util.module_from_spec(_auth_spec)
+    sys.modules[_AUTH_MODULE_NAME] = _auth
+    _auth_spec.loader.exec_module(_auth)
+
+get_auth_scope = _auth.get_auth_scope
+get_token = _auth.get_token
+clear_auth_scope = _auth.logout
+save_config = _auth.save_config
+save_token = _auth.save_token
 
 mcp = FastMCP("praxys", instructions="Training data tools for Praxys dashboard")
 
@@ -73,14 +96,13 @@ FRONTEND_URL = (
 # Remote helpers (HTTP API)
 # ---------------------------------------------------------------------------
 
-# Token path migrated from ~/.trainsight to ~/.praxys; still read legacy.
-_TOKEN_PATH = os.path.expanduser("~/.praxys/token")
-_LEGACY_TOKEN_PATH = os.path.expanduser("~/.trainsight/token")
-
-_NOT_AUTHENTICATED_MSG = (
-    "Not authenticated. Please run the `login` tool first with your "
-    "Praxys email and password, or manually cache a token at ~/.praxys/token"
-)
+def _not_authenticated_message() -> str:
+    """Return a profile-specific authentication hint."""
+    scope = get_auth_scope()
+    return (
+        "Not authenticated. Run the `login` tool for Praxys profile "
+        f"'{scope.profile}', or cache its token at {scope.token_path}"
+    )
 
 
 def _api_error_message(status_code: int, detail=None) -> str:
@@ -90,12 +112,9 @@ def _api_error_message(status_code: int, detail=None) -> str:
 
 def _get_remote_headers():
     """Get auth headers for remote API calls."""
-    for path in (_TOKEN_PATH, _LEGACY_TOKEN_PATH):
-        if os.path.exists(path):
-            with open(path) as f:
-                token = f.read().strip()
-            if token:
-                return {"Authorization": f"Bearer {token}"}
+    token = get_token()
+    if token:
+        return {"Authorization": f"Bearer {token}"}
     return {}
 
 
@@ -107,7 +126,7 @@ def _check_auth_error(res):
     message) is dropped, leaving the LLM caller with no actionable info.
     """
     if res.status_code == 401:
-        raise RuntimeError(_NOT_AUTHENTICATED_MSG)
+        raise RuntimeError(_not_authenticated_message())
     if res.status_code >= 400:
         detail = ""
         try:
@@ -233,7 +252,7 @@ def _local_route_result(callback):
         ) from exc
     except HTTPException as exc:
         if exc.status_code == 401:
-            raise RuntimeError(_NOT_AUTHENTICATED_MSG) from exc
+            raise RuntimeError(_not_authenticated_message()) from exc
         raise RuntimeError(
             _api_error_message(exc.status_code, exc.detail)
         ) from exc
@@ -246,7 +265,7 @@ def _local_data_user_id(db) -> str:
     user_id = _local_user_id()
     user = db.query(User).filter(User.id == user_id).first()
     if user is None:
-        raise RuntimeError(_NOT_AUTHENTICATED_MSG)
+        raise RuntimeError(_not_authenticated_message())
     if not user.is_demo:
         return user_id
     target = db.query(User).filter(
@@ -270,7 +289,7 @@ def _local_write_user_id(db) -> str:
     user_id = _local_user_id()
     user = db.query(User).filter(User.id == user_id).first()
     if user is None:
-        raise RuntimeError(_NOT_AUTHENTICATED_MSG)
+        raise RuntimeError(_not_authenticated_message())
     if user.is_demo:
         raise RuntimeError(
             _api_error_message(403, "Demo accounts cannot modify data")
@@ -1320,15 +1339,18 @@ def trigger_sync(sources: list[str] | None = None) -> str:
         # Local mode: sync requires the API server (background threads, rate limiting).
         # Try calling the local API if it's running.
         import requests
+        token = get_token()
+        if token is None:
+            return json.dumps({
+                "status": "not_authenticated",
+                "message": (
+                    "Local sync still uses the authenticated API. "
+                    + _not_authenticated_message()
+                ),
+            })
+        local_headers = {"Authorization": f"Bearer {token}"}
         try:
             url = "http://localhost:8000/api/sync"
-            # Local sync still goes through the API (needs auth + background tasks)
-            local_headers = {}
-            if os.path.exists(_TOKEN_PATH):
-                with open(_TOKEN_PATH) as f:
-                    t = f.read().strip()
-                if t:
-                    local_headers["Authorization"] = f"Bearer {t}"
             if sources:
                 results = []
                 for s in sources:
@@ -1384,6 +1406,7 @@ def login() -> str:
     """
     if not IS_REMOTE:
         return json.dumps({"status": "skipped", "message": "Login not needed in local mode"})
+    scope = get_auth_scope()
 
     import socket
     import threading
@@ -1449,14 +1472,7 @@ def login() -> str:
 
     if token_result["token"]:
         token = token_result["token"]
-        os.makedirs(os.path.dirname(_TOKEN_PATH), exist_ok=True)
-        with open(_TOKEN_PATH, "w") as f:
-            f.write(token)
-        # Restrict file permissions to owner only (0o600)
-        try:
-            os.chmod(_TOKEN_PATH, 0o600)
-        except OSError:
-            pass  # Windows doesn't support Unix permissions
+        token_path = save_token(token)
 
         # Fetch user info
         import requests
@@ -1466,12 +1482,18 @@ def login() -> str:
             timeout=10,
         )
         user_info = me_res.json() if me_res.ok else {}
+        save_config({
+            "url": REMOTE_URL,
+            "email": user_info.get("email", ""),
+        })
 
         return json.dumps({
             "status": "authenticated",
+            "profile": scope.profile,
             "email": user_info.get("email", ""),
+            "user_id": user_info.get("id"),
             "is_admin": user_info.get("is_superuser", False),
-            "token_cached": _TOKEN_PATH,
+            "token_cached": str(token_path),
         })
     else:
         return json.dumps({
@@ -1483,6 +1505,7 @@ def login() -> str:
 @mcp.tool()
 def whoami() -> str:
     """Show which Praxys account is currently authenticated."""
+    scope = get_auth_scope()
     if not IS_REMOTE:
         uid = _local_user_id()
         db = _local_db()
@@ -1491,14 +1514,21 @@ def whoami() -> str:
             user = db.query(User).filter(User.id == uid).first()
             return json.dumps({
                 "mode": "local",
+                "profile": scope.profile,
                 "email": user.email if user else "unknown",
                 "user_id": uid,
             })
         finally:
             db.close()
 
-    if not os.path.exists(_TOKEN_PATH):
-        return json.dumps({"status": "not_authenticated", "message": _NOT_AUTHENTICATED_MSG})
+    if get_token() is None:
+        return json.dumps({
+            "status": "not_authenticated",
+            "mode": "remote",
+            "profile": scope.profile,
+            "url": REMOTE_URL,
+            "message": _not_authenticated_message(),
+        })
 
     import requests
     headers = _get_remote_headers()
@@ -1509,9 +1539,32 @@ def whoami() -> str:
     data = res.json()
     return json.dumps({
         "mode": "remote",
+        "profile": scope.profile,
         "url": REMOTE_URL,
         "email": data.get("email"),
+        "user_id": data.get("id"),
         "is_admin": data.get("is_superuser", False),
+    })
+
+
+@mcp.tool()
+def logout() -> str:
+    """Delete the cached token and config for only the active profile."""
+    scope = get_auth_scope()
+    result = clear_auth_scope()
+    return json.dumps({
+        "status": (
+            "logged_out"
+            if result.removed_paths
+            or result.legacy_fallback_suppressed
+            else "not_authenticated"
+        ),
+        "profile": scope.profile,
+        "token_path": str(scope.token_path),
+        "removed": [str(path) for path in result.removed_paths],
+        "legacy_fallback_suppressed": (
+            result.legacy_fallback_suppressed
+        ),
     })
 
 

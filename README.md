@@ -55,7 +55,10 @@ In Claude Code:
 /plugin install praxys
 ```
 
-Then authenticate with the `login` MCP tool using your praxys.run email and password. Your token is cached locally at `~/.praxys/token`.
+Then authenticate with the `login` MCP tool. It opens praxys.run in your
+browser and caches the returned token locally at `~/.praxys/token`. Use
+`whoami` to verify the account and `logout` to remove only that active
+authentication scope.
 
 ## Configuration
 
@@ -66,12 +69,56 @@ The plugin defaults to the production backend at `https://api.praxys.run`. Overr
 | `PRAXYS_URL` | Override backend API URL |
 | `PRAXYS_FRONTEND_URL` | Override the browser-login URL |
 | `PRAXYS_LOCAL=1` | Switch into local-development mode (see below) |
+| `PRAXYS_PROFILE` | Use an isolated named authentication profile |
+| `PRAXYS_TOKEN_PATH` | Explicit token-file override for automation or testing |
+
+### Multiple authentication profiles
+
+The default profile remains backward compatible: it writes
+`~/.praxys/token` and reads the legacy `~/.trainsight/token` only when the
+modern token is absent.
+
+Set `PRAXYS_PROFILE` when a second MCP server must authenticate as a different
+Praxys user. For example, `PRAXYS_PROFILE=dev-test` stores its token and config
+under `~/.praxys/profiles/dev-test/` and never falls back to the default or
+legacy token. Profile names may contain letters, numbers, underscores, and
+hyphens. `PRAXYS_TOKEN_PATH` provides a fully isolated explicit path and also
+disables legacy fallback.
+
+```json
+{
+  "mcpServers": {
+    "praxys": {
+      "command": "python",
+      "args": ["/path/to/praxys-coach-plugin/mcp-server/server.py"]
+    },
+    "praxys-dev-test": {
+      "command": "python",
+      "args": ["/path/to/praxys-coach-plugin/mcp-server/server.py"],
+      "env": {
+        "PRAXYS_PROFILE": "dev-test",
+        "PRAXYS_URL": "https://api.praxys.run",
+        "PRAXYS_FRONTEND_URL": "https://www.praxys.run"
+      }
+    }
+  }
+}
+```
+
+Run each server's `login` once, then confirm that `whoami` reports the expected
+profile, user ID, and email. `logout` deletes only the selected profile's token
+and config.
 
 ## Local development
 
 Local mode (`PRAXYS_LOCAL=1`) imports directly from the Praxys Python codebase instead of going over HTTP. This is only useful if you have the (private) main `praxys` repo checked out — the plugin expects to live three directories deep inside that repo (`<praxys>/plugins/praxys/...`). The main repo wires it in as a git submodule at that path.
 
 If you only want to use the plugin against praxys.run, ignore this section — remote mode is the default and needs no setup beyond `login`.
+
+Most local tools read or write the development database directly and do not
+need login. `trigger_sync` is the exception because it uses the authenticated
+local API for background sync behavior; it reads only the active profile's
+token and fails clearly when that scope has none.
 
 ## License
 

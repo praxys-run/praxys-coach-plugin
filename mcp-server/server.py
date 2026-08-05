@@ -12,8 +12,9 @@ Mode detection (in priority order):
 Production is the default so the plugin works out-of-the-box for end users.
 Set PRAXYS_LOCAL=1 in your shell to develop against the local FastAPI/DB.
 """
-import json
+import importlib
 import importlib.util
+import json
 import os
 import sys
 import logging
@@ -90,6 +91,20 @@ FRONTEND_URL = (
     or _clean(os.environ.get("TRAINSIGHT_FRONTEND_URL"))
     or (_DEFAULT_FRONTEND if IS_REMOTE else "")
 )
+
+_LOCAL_PRELOAD_MODULES = (
+    "api.deps",
+    "api.routes.plan",
+    "api.routes.settings",
+)
+
+
+def _preload_local_modules() -> None:
+    """Load Pandas-backed host modules before FastMCP starts its event loop."""
+    if IS_REMOTE:
+        return
+    for module_name in _LOCAL_PRELOAD_MODULES:
+        importlib.import_module(module_name)
 
 
 # ---------------------------------------------------------------------------
@@ -1569,4 +1584,5 @@ def logout() -> str:
 
 
 if __name__ == "__main__":
+    _preload_local_modules()
     mcp.run()

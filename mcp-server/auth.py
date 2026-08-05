@@ -1,87 +1,226 @@
-"""JWT authentication for remote Praxys API."""
+"""Profile-scoped JWT authentication for the remote Praxys API."""
+from __future__ import annotations
+
+from dataclasses import dataclass
+import getpass
 import json
 import os
-import getpass
+from pathlib import Path
+import re
 
 import requests
 
-# Config dir migrated from ~/.trainsight to ~/.praxys for the rebrand. We
-# read both during the deprecation window so existing CLI users keep their
-# cached token; new writes always go to ~/.praxys.
+
 CONFIG_DIR = os.path.expanduser("~/.praxys")
 LEGACY_CONFIG_DIR = os.path.expanduser("~/.trainsight")
 TOKEN_PATH = os.path.join(CONFIG_DIR, "token")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 _LEGACY_TOKEN_PATH = os.path.join(LEGACY_CONFIG_DIR, "token")
 _LEGACY_CONFIG_PATH = os.path.join(LEGACY_CONFIG_DIR, "config.json")
+_PROFILE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 
 
-def get_config() -> dict:
-    """Load stored remote API config (url, email)."""
-    if os.path.exists(CONFIG_PATH):
-        with open(CONFIG_PATH) as f:
-            return json.load(f)
-    if os.path.exists(_LEGACY_CONFIG_PATH):
-        with open(_LEGACY_CONFIG_PATH) as f:
-            return json.load(f)
-    return {}
+@dataclass(frozen=True)
+class AuthScope:
+    """Resolved storage paths for one MCP authentication profile."""
+
+    profile: str
+    token_path: Path
+    config_path: Path
+    fallback_token_paths: tuple[Path, ...] = ()
+    fallback_config_paths: tuple[Path, ...] = ()
+    legacy_suppression_path: Path | None = None
 
 
-def save_config(config: dict):
-    """Persist remote API config."""
-    os.makedirs(CONFIG_DIR, exist_ok=True)
-    with open(CONFIG_PATH, "w") as f:
-        json.dump(config, f, indent=2)
+@dataclass(frozen=True)
+class LogoutResult:
+    """Filesystem changes made while logging out one auth scope."""
+
+    removed_paths: tuple[Path, ...]
+    legacy_fallback_suppressed: bool = False
 
 
-def get_token() -> str | None:
-    """Read cached JWT token."""
-    if os.path.exists(TOKEN_PATH):
-        with open(TOKEN_PATH) as f:
-            return f.read().strip()
-    if os.path.exists(_LEGACY_TOKEN_PATH):
-        with open(_LEGACY_TOKEN_PATH) as f:
-            return f.read().strip()
+def _profile_name() -> str:
+    """Return and validate the selected authentication profile."""
+    profile = os.environ.get("PRAXYS_PROFILE", "").strip()
+    if not profile:
+        return "default"
+    if not _PROFILE_PATTERN.fullmatch(profile):
+        raise ValueError(
+            "PRAXYS_PROFILE must start with a letter or number and contain "
+            "only letters, numbers, underscores, or hyphens"
+        )
+    return profile
+
+
+def get_auth_scope() -> AuthScope:
+    """Resolve token and config paths for the active authentication profile."""
+    profile = _profile_name()
+    explicit_token_path = os.environ.get("PRAXYS_TOKEN_PATH", "").strip()
+    if explicit_token_path:
+        token_path = Path(
+            os.path.expandvars(explicit_token_path)
+        ).expanduser().resolve()
+        return AuthScope(
+            profile=profile,
+            token_path=token_path,
+            config_path=token_path.with_name(
+                f"{token_path.name}.config.json"
+            ),
+        )
+
+    if profile == "default":
+        return AuthScope(
+            profile=profile,
+            token_path=Path(TOKEN_PATH),
+            config_path=Path(CONFIG_PATH),
+            fallback_token_paths=(Path(_LEGACY_TOKEN_PATH),),
+            fallback_config_paths=(Path(_LEGACY_CONFIG_PATH),),
+            legacy_suppression_path=Path(CONFIG_DIR)
+            / ".legacy-auth-disabled",
+        )
+
+    profile_dir = Path(CONFIG_DIR) / "profiles" / profile
+    return AuthScope(
+        profile=profile,
+        token_path=profile_dir / "token",
+        config_path=profile_dir / "config.json",
+    )
+
+
+def _first_existing_path(
+    primary: Path,
+    fallbacks: tuple[Path, ...],
+) -> Path | None:
+    """Return the first existing path in priority order."""
+    for path in (primary, *fallbacks):
+        if path.is_file():
+            return path
     return None
 
 
-def save_token(token: str):
-    """Cache JWT token to disk."""
-    os.makedirs(CONFIG_DIR, exist_ok=True)
-    with open(TOKEN_PATH, "w") as f:
-        f.write(token)
+def _active_fallbacks(
+    scope: AuthScope,
+    paths: tuple[Path, ...],
+) -> tuple[Path, ...]:
+    """Return legacy fallbacks unless this profile explicitly logged out."""
+    suppression_path = scope.legacy_suppression_path
+    if suppression_path is not None and suppression_path.is_file():
+        return ()
+    return paths
 
 
-def login(base_url: str, email: str = None, password: str = None) -> str:
-    """Login to Praxys API and cache token. Returns access_token."""
+def get_config() -> dict:
+    """Load stored remote API config for the active profile."""
+    scope = get_auth_scope()
+    path = _first_existing_path(
+        scope.config_path,
+        _active_fallbacks(scope, scope.fallback_config_paths),
+    )
+    if path is None:
+        return {}
+    with path.open(encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def save_config(config: dict) -> None:
+    """Persist remote API config for the active profile."""
+    path = get_auth_scope().config_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(config, handle, indent=2)
+
+
+def get_token() -> str | None:
+    """Read the cached JWT token for the active profile."""
+    scope = get_auth_scope()
+    path = _first_existing_path(
+        scope.token_path,
+        _active_fallbacks(scope, scope.fallback_token_paths),
+    )
+    if path is None:
+        return None
+    token = path.read_text(encoding="utf-8").strip()
+    return token or None
+
+
+def save_token(token: str) -> Path:
+    """Cache a JWT token for the active profile and return its path."""
+    scope = get_auth_scope()
+    path = scope.token_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(token, encoding="utf-8")
+    suppression_path = scope.legacy_suppression_path
+    if suppression_path is not None:
+        try:
+            suppression_path.unlink()
+        except FileNotFoundError:
+            pass
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+    return path
+
+
+def logout() -> LogoutResult:
+    """Log out the active profile without deleting legacy-client state."""
+    scope = get_auth_scope()
+    removed: list[Path] = []
+    for path in (scope.token_path, scope.config_path):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            continue
+        removed.append(path)
+
+    suppressed = False
+    suppression_path = scope.legacy_suppression_path
+    if suppression_path is not None:
+        suppression_path.parent.mkdir(parents=True, exist_ok=True)
+        suppression_path.write_text(
+            "Legacy auth fallback disabled by the Praxys MCP logout tool.\n",
+            encoding="utf-8",
+        )
+        suppressed = True
+    return LogoutResult(
+        removed_paths=tuple(removed),
+        legacy_fallback_suppressed=suppressed,
+    )
+
+
+def login(
+    base_url: str,
+    email: str | None = None,
+    password: str | None = None,
+) -> str:
+    """Login to the Praxys API and cache the token in the active profile."""
     if not email:
         email = input("Email: ")
     if not password:
         password = getpass.getpass("Password: ")
 
-    res = requests.post(
+    response = requests.post(
         f"{base_url}/api/auth/login",
         data={"username": email, "password": password},
         headers={"Content-Type": "application/x-www-form-urlencoded"},
     )
-    res.raise_for_status()
-    token = res.json()["access_token"]
+    response.raise_for_status()
+    token = response.json()["access_token"]
     save_token(token)
     save_config({"url": base_url, "email": email})
     return token
 
 
 def ensure_authenticated(base_url: str) -> str:
-    """Get a valid token, logging in if needed."""
+    """Get a valid scoped token, logging in interactively when needed."""
     token = get_token()
     if token:
-        # Test if token is still valid
-        res = requests.get(
-            f"{base_url}/api/health",
+        response = requests.get(
+            f"{base_url}/api/auth/me",
             headers={"Authorization": f"Bearer {token}"},
         )
-        if res.ok:
+        if response.ok:
             return token
-    # Token expired or missing — re-login
     config = get_config()
     return login(base_url, email=config.get("email"))

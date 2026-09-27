@@ -1,8 +1,8 @@
-# Praxys Coach — Claude Code Plugin
+# Praxys Coach — Agent Plugin
 
-Claude Code plugin that surfaces [Praxys Coach](https://www.praxys.run) — a power-based scientific training dashboard for endurance athletes — through MCP tools and skills, so you can ask your training questions directly from your terminal.
+Plugin for Codex and Claude Code that surfaces [Praxys Coach](https://www.praxys.run) — a power-based scientific training dashboard for endurance athletes — through MCP tools and skills, so you can ask your training questions directly from your terminal.
 
-> Praxys Coach brings supported training and recovery data together, computes power-based training metrics, and serves them via a web dashboard at praxys.run. This plugin is a thin Claude Code client that lets an agent read and act on that data on your behalf.
+> Praxys Coach brings supported training and recovery data together, computes power-based training metrics, and serves them via a web dashboard at praxys.run. This plugin is a thin agent client that lets an agent read and act on that data on your behalf.
 
 ## Skills
 
@@ -48,12 +48,58 @@ reused after the UTC review window changes.
 
 You need an account at [praxys.run](https://www.praxys.run) (free, invitation-based) before the plugin is useful — the plugin is the agent client, not the data source.
 
+### Python prerequisites
+
+The MCP server runs locally with Python 3.10 or later. Install the dependencies
+in the Python environment used to launch your agent (macOS/Linux shell example):
+
+```sh
+git clone https://github.com/praxys-run/praxys-coach-plugin.git praxys
+cd praxys
+python3 -m venv ../praxys-venv
+source ../praxys-venv/bin/activate
+python -m pip install -r mcp-server/requirements.txt
+```
+
+On Windows, activate the environment with `..\praxys-venv\Scripts\Activate.ps1` in
+PowerShell. The plugin launches `python`, so keep this environment active when
+starting Codex or Claude Code. Plugin installation does not install Python
+packages for you.
+
+### Codex CLI
+
+With a current Codex CLI that supports `codex plugin` (commands checked with
+0.153.4), register this checkout as a local marketplace and install the plugin:
+
+```sh
+codex plugin marketplace add .
+codex plugin list --marketplace praxys-coach --available --json
+codex plugin add praxys@praxys-coach
+codex plugin list
+codex
+```
+
+Run these commands from the checkout root after activating the Python
+environment above. The existing marketplace exposes `praxys`; Codex loads
+`.codex-plugin/plugin.json`, the same eight skills, and one `praxys` MCP server.
+The Codex manifest resolves the server working directory relative to the
+installed plugin, so launching Codex from another project also works. Start a
+new Codex session after installation to load the tools and skills.
+
+To track the Git marketplace instead of a local checkout, use
+`codex plugin marketplace add https://github.com/praxys-run/praxys-coach-plugin.git`
+for the marketplace-add step. The Python prerequisites still apply.
+
+### Claude Code
+
 In Claude Code:
 
 ```
 /plugin marketplace add github:dddtc2005/praxys-coach-plugin
 /plugin install praxys
 ```
+
+### Authenticate (both hosts)
 
 Then authenticate with the `login` MCP tool. It opens praxys.run in your
 browser with opaque, expiring handoff state. After first-party approval, the
@@ -82,6 +128,25 @@ its own access, grant AI processing, delete context, or persist conversation
 text. Local direct-DB mode resolves the same server-authoritative grant tables
 and does not bypass purpose, expiry, revocation, ownership, or single-use
 checks.
+
+### Troubleshooting
+
+- **Plugin or skills missing:** check `codex plugin list` and confirm `praxys`
+  is installed and enabled. Reopen Codex in a new session. If the marketplace
+  is missing, run the marketplace-add command from the checkout root.
+- **MCP server fails to start:** in the shell used to launch the agent, run
+  `python -c "import mcp, requests"`. Activate the environment and reinstall
+  `mcp-server/requirements.txt` if imports fail. Keep `mcp-server/server.py`
+  and the manifests together in the plugin package; do not copy only the
+  Codex manifest into another directory.
+- **Login expired or not approved:** call `login` again and approve the fresh
+  browser handoff, then call `whoami`.
+- **Wrong account:** check `whoami` and `PRAXYS_PROFILE` in the shell used to
+  launch the agent. Select the intended profile, restart the agent, and log in
+  for that profile. See multiple authentication profiles below.
+- **Backend unavailable:** check `PRAXYS_URL` and retry when the backend is
+  reachable. Login and training tools require the backend in default remote
+  mode; installing the plugin does not provide an offline data source.
 
 ## Configuration
 
@@ -136,7 +201,7 @@ and config.
 
 Local mode (`PRAXYS_LOCAL=1`) imports directly from the Praxys Python codebase instead of going over HTTP. This is only useful if you have the (private) main `praxys` repo checked out — the plugin expects to live three directories deep inside that repo (`<praxys>/plugins/praxys/...`). The main repo wires it in as a git submodule at that path.
 
-If you only want to use the plugin against praxys.run, ignore this section — remote mode is the default and needs no setup beyond `login`.
+If you only want to use the plugin against praxys.run, ignore this section — remote mode is the default and needs only the Python prerequisites, plugin installation, and `login` above.
 
 Most local tools read or write the development database directly and do not
 need login. `trigger_sync` is the exception because it uses the authenticated

@@ -1,0 +1,47 @@
+{
+  "name": "praxys",
+  "version": "1.0.0",
+  "description": "Praxys training dashboard \u2014 MCP tools for training data, daily briefs, race forecasts, and AI plan management",
+  "author": {
+    "name": "Fei Tao",
+    "url": "https://github.com/dddtc2005"
+  },
+  "repository": "https://github.com/praxys-run/praxys-coach-plugin",
+  "homepage": "https://www.praxys.run",
+  "license": "MIT",
+  "keywords": [
+    "training",
+    "running",
+    "power",
+    "garmin",
+    "strava",
+    "coros",
+    "oura",
+    "fitness"
+  ],
+  "skills": "./skills/",
+  "mcpServers": {
+    "praxys": {
+      "command": "python",
+      "args": [
+        "server.py"
+      ],
+      "cwd": "./mcp-server"
+    }
+  },
+  "interface": {
+    "displayName": "Praxys Coach",
+    "shortDescription": "Training data, daily briefs, and plan management",
+    "longDescription": "Connect Praxys Coach to read training data, review recovery and race forecasts, and manage training plans through shared MCP tools and skills.",
+    "developerName": "Fei Tao",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://www.praxys.run",
+    "defaultPrompt": [
+      "Show my Praxys daily training brief."
+    ]
+  }
+}
